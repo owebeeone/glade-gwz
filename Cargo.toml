@@ -1,0 +1,25 @@
+[package]
+name = "glade-gwz"
+version = "0.0.0"
+edition = "2021"
+description = "a glade supplier: gwz workspace commands over an EXCHANGE surface + long-op output on a LOG surface (GLP-0006 P1.S2). Wraps the frozen wire via glade-client; no node internals (P00-a)."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "glade-gwz"
+path = "src/bin/glade-gwz.rs"
+
+[dependencies]
+glade-client = { path = "../glade/client-rs" }
+glade-wire = { path = "../glade/wire-rs" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
+
+[dev-dependencies]
+# integration tests spawn the glade-node BINARY (no node internals — P00-a) and
+# the glade-gwz binary (CARGO_BIN_EXE_glade-gwz), plus a REAL `gwz` invocation on
+# a scratch workspace the test creates. `process` reads the node's port line.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }

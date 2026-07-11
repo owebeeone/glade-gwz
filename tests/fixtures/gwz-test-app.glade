@@ -1,0 +1,21 @@
+# gwz-test-app.glade — the minimal app declaration the glade-gwz tests boot the
+# node with. Declares exactly the two surfaces glade-gwz stands behind, plus the
+# workspace share that makes them routable (audit F1: the loading node mints the
+# WorkspaceEntry + ServeClaim, so `(ws-razel, gwz.ops)` routes Local).
+#
+# This mirrors grazel-app.glade's `service … gwz.ops` + `workspace ws-razel razel`
+# leg (discovery.ts phase D) and adds the gwz.output log surface for streaming.
+glade-app v0
+app gwz-test
+
+# the command surface: a directed exchange, answered by the attached provider.
+service gwz gwz.ops
+
+# the long-op output surface: appended ops fold + replicate to subscribers.
+binding gwz.output log share commons from-cursor
+
+# bootstrap grant (data only — enforcement is stage-2).
+seed owner gwz gwz.*
+
+# the workspace share this app serves from; the booted loader is its host.
+workspace ws-razel razel

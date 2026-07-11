@@ -1,0 +1,426 @@
+//! Integration: the glade-gwz supplier against a SPAWNED glade-node booted with
+//! an app file that declares the gwz exchange + output surfaces (never the real
+//! `~/.glade` — temp GLADE_HOME/HOME + temp store). The crate holds no node
+//! internals; the tests talk to the shipped binaries exactly as a deployment
+//! would. Coverage the plan names (§P1.S2, Tests):
+//!
+//!   1. allow-listed verbs (status/ls/diff) round-trip against a REAL `gwz`
+//!      invocation on a scratch workspace the test creates (`gwz init`).
+//!   2. a disallowed verb + a scope-redirecting arg are failure-as-DATA.
+//!   3. a timeout is failure-as-DATA (a slow shim binary — the timeout machinery
+//!      deterministically, without a long real command; clearly marked).
+//!   4. a streaming run's output appends are visible to a log subscriber, closed
+//!      by a `done:true` marker (REAL gwz).
+//!   5. the `glade-gwz` BINARY attaches, answers, and shuts down cleanly on
+//!      SIGTERM.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+
+use glade_client::GladeClient;
+use glade_gwz::{serve, GwzConfig, GwzOutputRecord, GwzResponse};
+
+// ---- harness --------------------------------------------------------------
+
+fn manifest() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+fn node_bin() -> PathBuf {
+    manifest().join("../glade/node/target/debug/glade-node")
+}
+fn app_file() -> PathBuf {
+    manifest().join("tests/fixtures/gwz-test-app.glade")
+}
+/// The real `gwz` binary — prefer the cargo-bin install so the test does not
+/// depend on PATH; fall back to `gwz` on PATH.
+fn gwz_bin() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = PathBuf::from(home).join(".cargo/bin/gwz");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("gwz")
+}
+
+/// The gate pre-builds the node; build once if absent so the suite is
+/// self-sufficient (the node has its own target dir — no lock clash).
+fn ensure_node_built() {
+    let bin = node_bin();
+    if bin.exists() {
+        return;
+    }
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--bin", "glade-node"])
+        .current_dir(manifest().join("../glade/node"))
+        .status()
+        .expect("build glade-node");
+    assert!(status.success() && bin.exists(), "glade-node missing after build");
+}
+
+/// A temp dir that removes itself on drop (never the real `~/.glade`).
+struct Tmp(PathBuf);
+impl Tmp {
+    fn new(tag: &str) -> Tmp {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let uniq = format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+        let p = std::env::temp_dir().join(format!("glade-gwz-{tag}-{uniq}"));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Tmp(p)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Read the node's `listening <port>` line (bounded), then drain stdout.
+async fn wait_listening(child: &mut Child) -> u16 {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let port = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(line) = lines.next_line().await.ok().flatten() {
+            if let Some(rest) = line.strip_prefix("listening ") {
+                if let Ok(p) = rest.trim().parse::<u16>() {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .expect("node printed a listening port");
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    port
+}
+
+/// Boot the node with the gwz-test app (declares gwz.ops exchange + gwz.output
+/// log + the ws-razel workspace share) under a temp GLADE_HOME/HOME.
+async fn boot(tmp: &Tmp) -> (Child, u16) {
+    ensure_node_built();
+    let mut child = Command::new(node_bin())
+        .args(["--profile", "local", "--name", "gwzit", "--app"])
+        .arg(app_file())
+        .arg("0")
+        .arg(tmp.path().join("store"))
+        .env("GLADE_HOME", tmp.path().join("gh"))
+        .env("HOME", tmp.path().join("h"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn booted glade-node");
+    let port = wait_listening(&mut child).await;
+    (child, port)
+}
+
+/// A fresh gwz workspace (`gwz init`) in a temp dir — the app-owned root the
+/// supplier serves against.
+fn make_gwz_workspace(tmp: &Tmp) -> PathBuf {
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let status = std::process::Command::new(gwz_bin())
+        .arg("--root")
+        .arg(&ws)
+        .arg("init")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run gwz init");
+    assert!(status.success(), "gwz init failed (is `gwz` installed?)");
+    ws
+}
+
+fn config_for(url: &str, root: PathBuf) -> GwzConfig {
+    let mut c = GwzConfig::new(url, root);
+    c.gwz_bin = gwz_bin();
+    c.principal = Some("gianni".into());
+    c
+}
+
+async fn poll<F, Fut>(mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if f().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Issue an exchange envelope and decode the `GwzResponse` payload. Asserts the
+/// WIRE ok is true (the exchange always produces a structured answer).
+async fn ask(requester: &GladeClient, envelope: &str) -> GwzResponse {
+    let out = requester
+        .exchange("ws-razel", "gwz.ops", envelope.as_bytes().to_vec())
+        .await
+        .expect("exchange");
+    assert!(out.ok, "wire ExchangeRes.ok is always true (failure is in the payload); error={:?}", out.error);
+    serde_json::from_slice(&out.payload.expect("payload")).expect("GwzResponse json")
+}
+
+// ---- 1. allow-listed verbs round-trip against real gwz ---------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allowlisted_verbs_round_trip_real_gwz() {
+    let tmp = Tmp::new("rt");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = make_gwz_workspace(&tmp);
+
+    let _sup = serve(config_for(&url, ws)).await.unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // wait for the provider to attach + answer (serve resolves on the ack, but
+    // poll defensively against residual ordering).
+    let r = requester.clone();
+    assert!(
+        poll(|| {
+            let r = r.clone();
+            async move {
+                r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                    .await
+                    .map(|o| o.ok)
+                    .unwrap_or(false)
+            }
+        })
+        .await,
+        "the gwz supplier attached and answered"
+    );
+
+    // status: ran clean, stdout non-empty (the freshly-init'd workspace has
+    // staged files), attribution stamped.
+    let status = ask(&requester, r#"{"verb":"status"}"#).await;
+    assert!(status.ok, "status ran clean: {status:?}");
+    assert_eq!(status.exit, Some(0));
+    assert!(!status.stdout.is_empty(), "status produced output: {status:?}");
+    assert_eq!(status.attributed_to.as_deref(), Some("gianni"));
+
+    // ls + diff also answer ok:true, exit 0.
+    let ls = ask(&requester, r#"{"verb":"ls"}"#).await;
+    assert!(ls.ok && ls.exit == Some(0), "ls: {ls:?}");
+    let diff = ask(&requester, r#"{"verb":"diff"}"#).await;
+    assert!(diff.ok && diff.exit == Some(0), "diff: {diff:?}");
+
+    // a request-supplied principal overrides the configured one (attribution as
+    // data).
+    let who = ask(&requester, r#"{"verb":"status","principal":"alice"}"#).await;
+    assert_eq!(who.attributed_to.as_deref(), Some("alice"));
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 2. disallowed verb + denied arg -> failure as data --------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disallowed_verb_and_denied_arg_fail_as_data() {
+    let tmp = Tmp::new("deny");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = make_gwz_workspace(&tmp);
+    let _sup = serve(config_for(&url, ws)).await.unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    // ensure attached
+    let r = requester.clone();
+    assert!(poll(|| { let r = r.clone(); async move { r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await.map(|o| o.ok).unwrap_or(false) } }).await);
+
+    // a mutating verb never reaches gwz — refused as data.
+    let commit = ask(&requester, r#"{"verb":"commit","args":["-m","x"]}"#).await;
+    assert!(!commit.ok, "commit refused: {commit:?}");
+    assert!(commit.error.as_deref().unwrap_or("").contains("allow-list"), "{commit:?}");
+    assert!(commit.exit.is_none(), "gwz was never invoked: {commit:?}");
+
+    // an allowed verb carrying a scope-redirecting arg is refused (root is
+    // app-owned).
+    let escape = ask(&requester, r#"{"verb":"status","args":["--root","/etc"]}"#).await;
+    assert!(!escape.ok && escape.error.as_deref().unwrap_or("").contains("not permitted"), "{escape:?}");
+
+    // a bad envelope is data, not a hang.
+    let bad = ask(&requester, "not json").await;
+    assert!(!bad.ok && bad.error.as_deref().unwrap_or("").contains("bad envelope"), "{bad:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 3. timeout -> failure as data (slow shim) -----------------------------
+
+/// Write an executable shim that ignores its args and sleeps past the timeout.
+fn write_slow_shim(tmp: &Tmp) -> PathBuf {
+    let shim = tmp.path().join("slow-gwz");
+    std::fs::write(&shim, "#!/bin/sh\nsleep 5\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    shim
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_fails_as_data() {
+    let tmp = Tmp::new("timeout");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+
+    // point the supplier at a SLOW SHIM (marked: not real gwz) with a short
+    // timeout, so `status` — allow-listed — trips the timeout deterministically.
+    let mut cfg = config_for(&url, tmp.path().join("ws"));
+    cfg.gwz_bin = write_slow_shim(&tmp);
+    cfg.timeout = Duration::from_millis(200);
+    let _sup = serve(cfg).await.unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // the first answer arrives (as a timeout) — poll for a decoded response.
+    let timed_out = poll(|| {
+        let r = requester.clone();
+        async move {
+            match r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await {
+                Ok(o) if o.ok => {
+                    let resp: GwzResponse = serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    !resp.ok && resp.error.as_deref().unwrap_or("").contains("timed out")
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    assert!(timed_out, "a slow command answers with a timeout, as data");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 4. streaming output visible to a subscriber ---------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_output_visible_to_subscriber() {
+    let tmp = Tmp::new("stream");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = make_gwz_workspace(&tmp);
+    let _sup = serve(config_for(&url, ws)).await.unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    let r = requester.clone();
+    assert!(poll(|| { let r = r.clone(); async move { r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await.map(|o| o.ok).unwrap_or(false) } }).await);
+
+    // a streaming run answers immediately with the run id.
+    let accepted = ask(&requester, r#"{"verb":"status","stream":true}"#).await;
+    assert!(accepted.ok && accepted.done == Some(false), "streaming accept: {accepted:?}");
+    let run_id = accepted.run_id.expect("run_id on the accept");
+
+    // a subscriber on the output surface, keyed by run id, converges the run's
+    // output ops + the terminal marker (from-cursor backfill covers timing).
+    let sub = GladeClient::new("subscriber");
+    sub.connect(&url).await.unwrap();
+    sub.subscribe("ws-razel", "gwz.output", Some(run_id.as_bytes())).await.unwrap();
+
+    let s = sub.clone();
+    let key = run_id.clone();
+    let converged = poll(|| {
+        let s = s.clone();
+        let key = key.clone();
+        async move {
+            let entries = s.fold_log("ws-razel", "gwz.output", Some(key.as_bytes())).await;
+            entries.iter().any(|e| {
+                serde_json::from_slice::<GwzOutputRecord>(e).map(|r| r.done == Some(true)).unwrap_or(false)
+            })
+        }
+    })
+    .await;
+    assert!(converged, "the streaming output + done marker reached the subscriber");
+
+    // decode the run: at least one output line, a terminal marker carrying
+    // exit 0, and every record stamped with the acting principal.
+    let entries = sub.fold_log("ws-razel", "gwz.output", Some(run_id.as_bytes())).await;
+    let recs: Vec<GwzOutputRecord> =
+        entries.iter().filter_map(|e| serde_json::from_slice(e).ok()).collect();
+    assert!(recs.iter().any(|r| r.stream == "stdout" && r.line.is_some()), "an output line: {recs:?}");
+    let end = recs.iter().find(|r| r.done == Some(true)).expect("terminal marker");
+    assert_eq!(end.exit, Some(0), "gwz status exited clean: {end:?}");
+    assert!(recs.iter().all(|r| r.principal.as_deref() == Some("gianni")), "run records attributed: {recs:?}");
+    // the run records are keyed by run id.
+    assert!(recs.iter().all(|r| r.run_id == run_id));
+
+    sub.close().await;
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 5. the binary attaches, answers, and shuts down on SIGTERM ------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_serves_and_shuts_down_on_sigterm() {
+    let tmp = Tmp::new("bin");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = make_gwz_workspace(&tmp);
+
+    let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gwz"))
+        .args(["--node", &url, "--root"])
+        .arg(&ws)
+        .args(["--share", "ws-razel", "--principal", "tester", "--gwz-bin"])
+        .arg(gwz_bin())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gwz binary");
+    let pid = supplier.id().expect("binary pid");
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // the binary attached: a real gwz.status round-trips through it.
+    let answered = poll(|| {
+        let r = requester.clone();
+        async move {
+            match r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await {
+                Ok(o) if o.ok => {
+                    let resp: GwzResponse = serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    resp.ok && resp.attributed_to.as_deref() == Some("tester")
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    assert!(answered, "the glade-gwz binary attached and answered a real gwz.status");
+
+    // SIGTERM -> clean shutdown (exit 0).
+    let killed = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status().expect("send SIGTERM");
+    assert!(killed.success(), "sent SIGTERM");
+    let status = tokio::time::timeout(Duration::from_secs(10), supplier.wait())
+        .await
+        .expect("binary exited after SIGTERM")
+        .expect("wait");
+    assert!(status.success(), "clean shutdown exit 0, got {status:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
