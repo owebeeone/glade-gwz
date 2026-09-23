@@ -5,7 +5,7 @@
 #
 # This mirrors grazel-app.glade's `service … gwz.ops` + `workspace ws-razel razel`
 # leg (discovery.ts phase D) and adds the gwz.output log surface for streaming.
-glade-app v0
+glade-app v1
 app gwz-test
 
 # the command surface: a directed exchange, answered by the attached provider.
