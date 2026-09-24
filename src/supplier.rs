@@ -14,7 +14,8 @@
 //!   log surface keyed by `run_id`, closed by a `{done:true, exit}` marker.
 //!
 //! Reattach-on-drop + clean detach come from the kit's [`Supplier`]; the crate
-//! holds zero node internals (the wire + a client lib only).
+//! holds zero node internals (the wire + a client lib only). Every op the node
+//! refuses is said on stderr ([`say_refusals`]).
 
 use std::io;
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use glade_client::supplier::{Supplier, SupplierConfig, SupplierSurface};
-use glade_client::GladeClient;
+use glade_client::{GladeClient, OpStatus};
 use glade_wire::generated::ExchangeReq;
 
 use crate::envelope::{GwzOutputRecord, GwzRequest, GwzResponse};
@@ -102,10 +103,10 @@ pub async fn serve(config: GwzConfig) -> io::Result<GwzSupplier> {
         SupplierConfig { principal: config.principal.clone(), ..Default::default() },
     );
 
-    // The client-writes plan's Step 4.2 also puts an `on_refused` listener on
-    // `client` here, logging every op the node refuses. It needs client-rs
-    // Step 3.1, which is not built, so until then a refused output record is
-    // lost unseen (`append_output`).
+    // Listening before anything is written: the output records go out
+    // fire-and-forget, and this is where their refusals land (client-writes
+    // plan, Step 4.2).
+    tokio::spawn(say_refusals(client.on_refused().await));
 
     let handler = make_handler(client.clone(), config.clone(), Handle::current());
     supplier
@@ -310,10 +311,30 @@ fn spawn_stream(
 
 /// Append one output record to the log surface, keyed by run id (the value/log
 /// serve act — an op the node folds + replicates to subscribers, §2). A record
-/// the node refuses goes unseen: the client does not read the node's answer yet
-/// (the `on_refused` note in [`serve`]).
+/// the node refuses is said by [`say_refusals`].
 async fn append_output(client: &GladeClient, config: &GwzConfig, run_id: &str, rec: &GwzOutputRecord) {
     let _ = client
         .append(&config.share, &config.output_id, "log", rec.to_bytes(), Some(run_id.as_bytes()))
         .await;
+}
+
+/// Say every op the node refuses, with its chain, its seq and its code, until
+/// the client is gone (client-writes plan, Step 4.2). The client has already
+/// dropped a refused record with the later records of its chain, and appends
+/// none there until a subscribe of its zone, which this supplier never makes:
+/// the rest of that run's output goes nowhere.
+async fn say_refusals(mut refused: mpsc::UnboundedReceiver<OpStatus>) {
+    while let Some(OpStatus { op, code, message }) = refused.recv().await {
+        let chain = if op.key.is_empty() {
+            format!("{}/{}", op.share, op.glade_id)
+        } else {
+            let key = String::from_utf8_lossy(&op.key);
+            format!("{}/{}[{key}]", op.share, op.glade_id)
+        };
+        eprintln!(
+            "glade-gwz: the node refused seq {} of {chain}: {code:?}, {message}; the rest of \
+             that chain is dropped",
+            op.seq
+        );
+    }
 }

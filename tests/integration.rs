@@ -15,6 +15,8 @@
 //!      SIGTERM.
 //!   6. a RESTARTED supplier streams its first run: a subscriber on the new
 //!      run's id folds that run's output, not an earlier process's (REAL gwz).
+//!   7. a record the node REFUSES is said on the binary's stderr, with its
+//!      chain, its seq and its code (a gated shim, clearly marked).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,7 +26,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-use glade_client::GladeClient;
+use glade_client::{GladeClient, OpOutcome};
 use glade_gwz::{serve, GwzConfig, GwzOutputRecord, GwzResponse};
 
 // ---- harness --------------------------------------------------------------
@@ -268,16 +270,22 @@ async fn disallowed_verb_and_denied_arg_fail_as_data() {
 
 // ---- 3. timeout -> failure as data (slow shim) -----------------------------
 
-/// Write an executable shim that ignores its args and sleeps past the timeout.
-fn write_slow_shim(tmp: &Tmp) -> PathBuf {
-    let shim = tmp.path().join("slow-gwz");
-    std::fs::write(&shim, "#!/bin/sh\nsleep 5\n").unwrap();
+/// Write an executable shell script standing in for `gwz` (marked: not the real
+/// binary), named `name` in the test's temp dir.
+fn write_shim(tmp: &Tmp, name: &str, script: &str) -> PathBuf {
+    let shim = tmp.path().join(name);
+    std::fs::write(&shim, script).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     shim
+}
+
+/// Write an executable shim that ignores its args and sleeps past the timeout.
+fn write_slow_shim(tmp: &Tmp) -> PathBuf {
+    write_shim(tmp, "slow-gwz", "#!/bin/sh\nsleep 5\n")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -562,6 +570,129 @@ async fn a_restarted_supplier_streams_its_first_run() {
         "a restarted supplier never reuses an earlier process's run id"
     );
 
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 7. a record the node refuses is said -----------------------------------
+
+/// A shim (marked: not the real `gwz`) that ignores its args, waits until the
+/// test opens `gate`, for ten seconds at most, and then prints one line: so the
+/// test can take the run's output zone before the run's first record.
+fn write_gated_shim(tmp: &Tmp, gate: &Path) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\nn=0\nwhile [ ! -e '{}' ] && [ \"$n\" -lt 200 ]; do\n  sleep 0.05\n  \
+         n=$((n + 1))\ndone\necho 'after the squatter'\n",
+        gate.display()
+    );
+    write_shim(tmp, "gated-gwz", &script)
+}
+
+/// Every op the node refuses is said on stderr, with its chain, its seq and its
+/// code (client-writes plan, Step 4.2). The node refuses here for a reason the
+/// supplier cannot see coming: a test client puts a `crdt` op on the run's
+/// output zone before the run's first line, and the node refuses a `log` op on a
+/// `crdt` zone as a shape conflict (`node/src/store.rs`). The BINARY runs,
+/// because what is under test is what it says on stderr.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_the_node_refuses_is_reported() {
+    let tmp = Tmp::new("refused");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    // The shim never reads the root, so an empty directory serves.
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let gate = tmp.path().join("gate");
+
+    let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gwz"))
+        .args(["--node", &url, "--root"])
+        .arg(&ws)
+        .args(["--share", "ws-razel", "--principal", "tester", "--gwz-bin"])
+        .arg(write_gated_shim(&tmp, &gate))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gwz binary");
+    let pid = supplier.id().expect("binary pid");
+    let mut lines = BufReader::new(supplier.stderr.take().expect("piped stderr")).lines();
+
+    // Attached: a verb outside the allow-list is answered as data, and runs no
+    // shim.
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    let attached = poll(|| {
+        let r = requester.clone();
+        async move {
+            r.exchange("ws-razel", "gwz.ops", br#"{"verb":"commit"}"#.to_vec())
+                .await
+                .map(|o| o.ok)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    assert!(attached, "the glade-gwz binary attached and answered");
+
+    // The run is accepted and its shim waits at the gate, while a squatter
+    // takes the run's output zone as a crdt one.
+    let run_id = stream_status(&requester).await;
+    let squatter = GladeClient::new("squatter");
+    squatter.connect(&url).await.unwrap();
+    let (_, held) = squatter
+        .append_outcome(
+            "ws-razel",
+            "gwz.output",
+            "crdt",
+            b"{}".to_vec(),
+            Some(run_id.as_bytes()),
+        )
+        .await
+        .expect("the squatter's op went out");
+    assert_eq!(
+        held,
+        OpOutcome::Accepted,
+        "the run's zone is a crdt one now"
+    );
+    std::fs::write(&gate, b"").unwrap();
+
+    // Everything it says, up to the line naming the refusal of the run's first
+    // record.
+    let named = format!("the node refused seq 0 of ws-razel/gwz.output[{run_id}]");
+    let mut said: Vec<String> = Vec::new();
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let found = line.contains(&named);
+            said.push(line);
+            if found {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(found, Ok(true)),
+        "stderr names the refusal of the run's first record: {said:#?}"
+    );
+    let refusal = said.last().expect("the refusal's line");
+    assert!(
+        refusal.contains("Protocol") && refusal.contains("shape conflict"),
+        "the refusal names its code and the node's reason: {refusal}"
+    );
+
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success(), "sent SIGTERM");
+    let status = tokio::time::timeout(Duration::from_secs(10), supplier.wait())
+        .await
+        .expect("binary exited after SIGTERM")
+        .expect("wait");
+    assert!(status.success(), "clean shutdown exit 0, got {status:?}");
+
+    squatter.close().await;
     requester.close().await;
     node.kill().await.ok();
 }
