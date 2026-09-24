@@ -15,7 +15,7 @@ service gwz gwz.ops
 binding gwz.output log share commons from-cursor
 
 # bootstrap grant (data only — enforcement is stage-2).
-seed owner gwz gwz.*
+seed owner ws-razel gwz.*
 
 # the workspace share this app serves from; the booted loader is its host.
 workspace ws-razel razel
