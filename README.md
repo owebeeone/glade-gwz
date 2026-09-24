@@ -58,19 +58,24 @@ s-verbs taxonomy; `gwz.*` seeds already ride `grazel-app.glade`).
 
 ## Long-op output (log `gwz.output`)
 
-`stream:true` answers immediately with `{ "run_id": "run-1", "done": false }`.
-The run's stdout/stderr lines are appended as ops to the log surface **keyed by
-`run_id`**:
+`stream:true` answers immediately with
+`{ "run_id": "run-mufa2wc2-1", "done": false }`. The run's stdout/stderr lines
+are appended as ops to the log surface **keyed by `run_id`**:
 
 ```json
-{ "run_id": "run-1", "seq": 1, "principal": "gianni", "stream": "stdout", "line": "…" }
+{ "run_id": "run-mufa2wc2-1", "seq": 1, "principal": "gianni", "stream": "stdout", "line": "…" }
 ```
 
 closed by a terminal marker:
 
 ```json
-{ "run_id": "run-1", "seq": 7, "principal": "gianni", "stream": "end", "done": true, "exit": 0 }
+{ "run_id": "run-mufa2wc2-1", "seq": 7, "principal": "gianni", "stream": "end", "done": true, "exit": 0 }
 ```
 
 A consumer subscribes `(share, gwz.output, run_id)` and folds the log to follow
 the run.
+
+The run id is opaque: key by the whole string. Each supplier process reads a tag
+off the clock when it starts serving, and mints `run-<tag>-<n>`. The node keeps
+the output log across a supplier restart, so an id an earlier process spent
+would put a new run on that run's chain, where the node refuses it.

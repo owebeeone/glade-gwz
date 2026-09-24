@@ -20,7 +20,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::runtime::Handle;
@@ -102,6 +102,11 @@ pub async fn serve(config: GwzConfig) -> io::Result<GwzSupplier> {
         SupplierConfig { principal: config.principal.clone(), ..Default::default() },
     );
 
+    // The client-writes plan's Step 4.2 also puts an `on_refused` listener on
+    // `client` here, logging every op the node refuses. It needs client-rs
+    // Step 3.1, which is not built, so until then a refused output record is
+    // lost unseen (`append_output`).
+
     let handler = make_handler(client.clone(), config.clone(), Handle::current());
     supplier
         .serve_exchange(SupplierSurface::new(&config.share, &config.glade_id, "exchange"), handler)
@@ -121,11 +126,75 @@ fn make_handler(
     config: Arc<GwzConfig>,
     handle: Handle,
 ) -> impl Fn(&ExchangeReq) -> Result<Vec<u8>, String> + Send + Sync + 'static {
-    let run_counter = Arc::new(AtomicU64::new(0));
+    let runs = Runs::new();
     move |req: &ExchangeReq| -> Result<Vec<u8>, String> {
-        let resp = answer(&client, &config, &handle, &run_counter, &req.payload);
+        let resp = answer(&client, &config, &handle, &runs, &req.payload);
         Ok(resp.to_bytes())
     }
+}
+
+/// The run ids one supplier process mints (the client-writes plan's F4), as
+/// glade-gyld's `Runs` does.
+///
+/// A counter alone is not enough. Every supplier process writes under the same
+/// origin (`serve`), a run's output goes on the `gwz.output` log keyed by its
+/// run id, and the node keeps that log across a restart. A counter that restarts
+/// with the process gives a fresh run an id an earlier process spent. The run's
+/// records then land on that run's chain: the node refuses every one from the
+/// first that differs, and a subscriber on the id folds the earlier run's
+/// output. The session tag makes the id unique across restarts; the counter
+/// orders the runs within one process.
+struct Runs {
+    /// Read once, when the supplier starts serving; different in the next process.
+    session: String,
+    next: AtomicU64,
+}
+
+impl Runs {
+    fn new() -> Runs {
+        Runs {
+            session: session_tag(),
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// The next run's id: distinct from every other id this process mints, and
+    /// from every earlier process's.
+    fn mint(&self) -> String {
+        mint_run_id(&self.session, self.next.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+}
+
+/// `run-<session>-<n>`. Opaque to readers: the desk keys the log by the whole
+/// string (`gryth-ui/packages/plugins/gwz/src/live.ts`) and parses none of it.
+fn mint_run_id(session: &str, n: u64) -> String {
+    format!("run-{session}-{n}")
+}
+
+/// This process's tag: milliseconds since the epoch in base36, as glade-gyld's
+/// `session_tag`. It is eight characters until 2059, and at one width it sorts
+/// as text the way it sorts in time. A clock before the epoch gives `0`.
+fn session_tag() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    base36(millis)
+}
+
+/// `n` in lowercase base36, most significant digit first.
+fn base36(mut n: u128) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize] as char);
+        n /= 36;
+    }
+    out.reverse();
+    out.into_iter().collect()
 }
 
 /// The command decision (pure w.r.t. the wire): parse → guard → run / stream.
@@ -133,7 +202,7 @@ fn answer(
     client: &GladeClient,
     config: &Arc<GwzConfig>,
     handle: &Handle,
-    run_counter: &Arc<AtomicU64>,
+    runs: &Runs,
     payload: &[u8],
 ) -> GwzResponse {
     let req = match GwzRequest::parse(payload) {
@@ -159,7 +228,7 @@ fn answer(
     }
 
     if req.stream {
-        let run_id = format!("run-{}", run_counter.fetch_add(1, Ordering::SeqCst) + 1);
+        let run_id = runs.mint();
         spawn_stream(client.clone(), config.clone(), handle.clone(), run_id.clone(), req, who.clone());
         return GwzResponse::accepted(run_id, who);
     }
@@ -240,7 +309,9 @@ fn spawn_stream(
 }
 
 /// Append one output record to the log surface, keyed by run id (the value/log
-/// serve act — an op the node folds + replicates to subscribers, §2).
+/// serve act — an op the node folds + replicates to subscribers, §2). A record
+/// the node refuses goes unseen: the client does not read the node's answer yet
+/// (the `on_refused` note in [`serve`]).
 async fn append_output(client: &GladeClient, config: &GwzConfig, run_id: &str, rec: &GwzOutputRecord) {
     let _ = client
         .append(&config.share, &config.output_id, "log", rec.to_bytes(), Some(run_id.as_bytes()))

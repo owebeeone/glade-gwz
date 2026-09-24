@@ -13,6 +13,8 @@
 //!      by a `done:true` marker (REAL gwz).
 //!   5. the `glade-gwz` BINARY attaches, answers, and shuts down cleanly on
 //!      SIGTERM.
+//!   6. a RESTARTED supplier streams its first run: a subscriber on the new
+//!      run's id folds that run's output, not an earlier process's (REAL gwz).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -420,6 +422,145 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
         .expect("binary exited after SIGTERM")
         .expect("wait");
     assert!(status.success(), "clean shutdown exit 0, got {status:?}");
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 6. a restarted supplier streams its first run -------------------------
+
+/// Poll until the attached supplier answers a plain `status`, as the tests
+/// above do before their first real request.
+async fn answering(requester: &GladeClient) -> bool {
+    poll(|| {
+        let r = requester.clone();
+        async move {
+            r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                .await
+                .map(|o| o.ok)
+                .unwrap_or(false)
+        }
+    })
+    .await
+}
+
+/// Start a streaming `status`; the run id the supplier answers with.
+async fn stream_status(requester: &GladeClient) -> String {
+    let accepted = ask(requester, r#"{"verb":"status","stream":true}"#).await;
+    assert!(
+        accepted.ok && accepted.done == Some(false),
+        "streaming accept: {accepted:?}"
+    );
+    accepted.run_id.expect("run_id on the accept")
+}
+
+/// A FRESH subscriber on one run's key, folded until a terminal marker is
+/// there: what the node holds under that run id, decoded.
+async fn follow_run(url: &str, run_id: &str) -> Vec<GwzOutputRecord> {
+    let sub = GladeClient::new("subscriber");
+    sub.connect(url).await.unwrap();
+    sub.subscribe("ws-razel", "gwz.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
+    let ended = poll(|| {
+        let s = sub.clone();
+        let key = run_id.to_string();
+        async move {
+            let entries = s
+                .fold_log("ws-razel", "gwz.output", Some(key.as_bytes()))
+                .await;
+            entries.iter().any(|e| {
+                serde_json::from_slice::<GwzOutputRecord>(e)
+                    .map(|r| r.done == Some(true))
+                    .unwrap_or(false)
+            })
+        }
+    })
+    .await;
+    assert!(
+        ended,
+        "run {run_id}: a terminal marker reached the subscriber"
+    );
+    let entries = sub
+        .fold_log("ws-razel", "gwz.output", Some(run_id.as_bytes()))
+        .await;
+    sub.close().await;
+    entries
+        .iter()
+        .filter_map(|e| serde_json::from_slice(e).ok())
+        .collect()
+}
+
+/// A restart is a new supplier process under the SAME origin (`serve` names the
+/// session after its share and exchange), and the node keeps every run's output
+/// chain across it. A restarted supplier that reused an earlier process's run id
+/// would put its first run on that run's chain: the node holds the records that
+/// match byte for byte and refuses the rest, unseen, so a subscriber on the new
+/// id folds the OLD run's output. The two runs must therefore differ: the
+/// workspace gains a file while no supplier runs, and only the second `gwz
+/// status` can name it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_supplier_streams_its_first_run() {
+    const NEW_FILE: &str = "between-the-runs.txt";
+    let tmp = Tmp::new("restart");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = make_gwz_workspace(&tmp);
+
+    // The desk's side stays connected across the restart.
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+
+    // ---- process one: a run streamed to its end, then shut down ------------
+    let first_supplier = serve(config_for(&url, ws.clone())).await.unwrap();
+    assert!(
+        answering(&requester).await,
+        "the first supplier attached and answered"
+    );
+    let first = stream_status(&requester).await;
+    let first_recs = follow_run(&url, &first).await;
+    assert!(
+        first_recs.iter().any(|r| r.line.is_some()),
+        "the first run streamed its lines: {first_recs:?}"
+    );
+    first_supplier.shutdown().await;
+
+    std::fs::write(ws.join(NEW_FILE), "made while no supplier ran\n").unwrap();
+
+    // ---- process two: a fresh supplier, the same node, the same origin -----
+    let _second_supplier = serve(config_for(&url, ws)).await.unwrap();
+    assert!(
+        answering(&requester).await,
+        "the restarted supplier attached and answered"
+    );
+    let second = stream_status(&requester).await;
+    let second_recs = follow_run(&url, &second).await;
+
+    let names_new_file = second_recs
+        .iter()
+        .any(|r| r.stream == "stdout" && r.line.as_deref().is_some_and(|l| l.contains(NEW_FILE)));
+    assert!(
+        names_new_file,
+        "a subscriber on the restarted supplier's run `{second}` folds that run's lines, \
+         not those of the first process's run `{first}`: {second_recs:?}"
+    );
+    let end = second_recs
+        .iter()
+        .find(|r| r.done == Some(true))
+        .expect("terminal marker");
+    assert_eq!(
+        end.exit,
+        Some(0),
+        "the second gwz status exited clean: {end:?}"
+    );
+    assert!(
+        second_recs.iter().all(|r| r.run_id == second),
+        "keyed by the second run's id: {second_recs:?}"
+    );
+    assert_ne!(
+        first, second,
+        "a restarted supplier never reuses an earlier process's run id"
+    );
 
     requester.close().await;
     node.kill().await.ok();
