@@ -1,0 +1,31 @@
+{
+  "rule": "No process-global mutable state in production code: statics with interior mutability, thread-local slots, environment or working-directory reads at the point of use, process-wide hooks and child processes that inherit the live environment. Pass state through configuration and context instead, read the process's arguments and environment once at the entry point, and spawn children with env_clear() plus an explicit environment. check_process_globals.py fails on anything unlisted and on entries that no longer match, so this list only shrinks. 'debt' entries are scheduled for removal (dev-docs/ProcessGlobalsPlan.md in the glade-wz workspace); 'permanent' entries are read once at a program's entry point or carry no shared state.",
+  "source": "scripts/checks/check_process_globals.py is gwz-core's checker at commit 730e7119 (gwz-dev workspace), vendored byte for byte; its own tests live there.",
+  "roots": [
+    "src/lib.rs",
+    "src/bin/glade-gwz.rs"
+  ],
+  "entries": [
+    {
+      "path": "src/bin/glade-gwz.rs",
+      "kind": "env",
+      "name": "env::args",
+      "disposition": "permanent",
+      "reason": "The program reads its arguments once, at its entry point, and passes them down."
+    },
+    {
+      "path": "src/exec.rs",
+      "kind": "process",
+      "name": "Command::new",
+      "disposition": "debt",
+      "reason": "Runs gwz with the live process environment; spawn it with env_clear() plus the supplier's captured environment (ProcessGlobalsPlan Step 3.2)."
+    },
+    {
+      "path": "src/supplier.rs",
+      "kind": "process",
+      "name": "Command::new",
+      "disposition": "debt",
+      "reason": "Runs a streamed gwz verb with the live process environment; spawn it with env_clear() plus the supplier's captured environment (ProcessGlobalsPlan Step 3.2)."
+    }
+  ]
+}
