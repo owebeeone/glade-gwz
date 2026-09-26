@@ -28,6 +28,10 @@ allowlist only shrinks.
   kind of entry on 2026-09-26. Any other new entry needs the owner's approval, with a
   disposition (`debt` or `permanent`) and a reason.
 - Paying a debt deletes its entry in the same change.
+- A child spawned with `env_clear()` plus an explicit environment stays listed, as
+  `permanent`. The checker lists every `Command::new` whether or not it clears the
+  environment, so only the tests show that it does. gwz-core records its own clean
+  spawn the same way.
 - The checker is gwz-core's, vendored byte for byte, and the allowlist's `source` names
   the commit. Update every repository's copy together.
 
