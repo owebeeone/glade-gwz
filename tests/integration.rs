@@ -17,7 +17,13 @@
 //!      run's id folds that run's output, not an earlier process's (REAL gwz).
 //!   7. a record the node REFUSES is said on the binary's stderr, with its
 //!      chain, its seq and its code (a gated shim, clearly marked).
+//!   8. gwz gets the environment its config carries and nothing else, from both
+//!      runners (an env-printing shim, clearly marked).
+//!   9. a variable set in the process after the capture never reaches gwz.
+//!  10. the BINARY gives gwz its whole start-up environment, and finds `gwz` on
+//!      that environment's PATH, as grazel starts it.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +33,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use glade_client::{GladeClient, OpOutcome};
-use glade_gwz::{serve, GwzConfig, GwzOutputRecord, GwzResponse};
+use glade_gwz::{serve, Environment, GwzConfig, GwzOutputRecord, GwzResponse};
 
 // ---- harness --------------------------------------------------------------
 
@@ -147,8 +153,10 @@ fn make_gwz_workspace(tmp: &Tmp) -> PathBuf {
     ws
 }
 
+/// A config whose gwz gets this test process's own environment, as it did when
+/// gwz inherited it.
 fn config_for(url: &str, root: PathBuf) -> GwzConfig {
-    let mut c = GwzConfig::new(url, root);
+    let mut c = GwzConfig::new(url, root, Environment::from_vars(std::env::vars_os()));
     c.gwz_bin = gwz_bin();
     c.principal = Some("gianni".into());
     c
@@ -694,5 +702,202 @@ async fn a_write_the_node_refuses_is_reported() {
 
     squatter.close().await;
     requester.close().await;
+    node.kill().await.ok();
+}
+
+// ---- 8-10. gwz runs with the captured environment, and only that ------------
+
+/// The made-up variable whose VALUE the env shim prints.
+const PROBE: &str = "GLADE_GWZ_TEST_PROBE";
+
+/// A shim (marked: not the real `gwz`), written to `name` in the test's temp
+/// dir, that ignores its args and prints `name <NAME>` for each variable in its
+/// environment, then `probe <value of PROBE>`. It prints no other value: a real
+/// environment can hold secrets.
+fn write_env_shim(tmp: &Tmp, name: &str) -> PathBuf {
+    let script = format!(
+        "#!/bin/sh\nexec /usr/bin/awk 'BEGIN {{ for (k in ENVIRON) print \"name \" k; \
+         print \"probe \" ENVIRON[\"{PROBE}\"] }}'\n"
+    );
+    write_shim(tmp, name, &script)
+}
+
+/// What the env shim printed: the names it saw, and the probe's value.
+fn read_env_shim<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> (BTreeSet<String>, Option<String>) {
+    let mut names = BTreeSet::new();
+    let mut probe = None;
+    for line in lines {
+        if let Some(name) = line.strip_prefix("name ") {
+            names.insert(name.to_string());
+        } else if let Some(value) = line.strip_prefix("probe ") {
+            probe = Some(value.to_string());
+        }
+    }
+    (names, probe)
+}
+
+/// The names the shim's own shell adds (`PWD`, `SHLVL`, …; shells differ):
+/// what it prints when started directly with an empty environment.
+fn shell_added_names(shim: &Path) -> BTreeSet<String> {
+    let out = std::process::Command::new(shim)
+        .env_clear()
+        .output()
+        .expect("run the env shim");
+    read_env_shim(String::from_utf8_lossy(&out.stdout).lines()).0
+}
+
+/// What gwz saw, started each way a request can start it: a blocking `status`,
+/// then a streamed one.
+async fn environments_seen(
+    requester: &GladeClient,
+    url: &str,
+) -> [(BTreeSet<String>, Option<String>); 2] {
+    let ran = ask(requester, r#"{"verb":"status"}"#).await;
+    assert!(ran.ok && ran.exit == Some(0), "the blocking run: {ran:?}");
+    let blocking = read_env_shim(ran.stdout.lines());
+    let run_id = stream_status(requester).await;
+    let recs = follow_run(url, &run_id).await;
+    let lines = recs.iter().filter(|r| r.stream == "stdout");
+    let streamed = read_env_shim(lines.filter_map(|r| r.line.as_deref()));
+    [blocking, streamed]
+}
+
+/// Both runners start gwz from an empty environment plus the config's snapshot
+/// (ProcessGlobalsPlan Step 3.2). The snapshot is made up, so this process's
+/// own variables, its `HOME` and `PATH` among them, are the ones that must not
+/// arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn gwz_gets_only_the_configured_environment() {
+    let tmp = Tmp::new("env-only");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let shim = write_env_shim(&tmp, "env-gwz");
+    let mut cfg = config_for(&url, tmp.path().join("ws"));
+    cfg.gwz_bin = shim.clone();
+    cfg.env = Environment::from_vars([(PROBE, "made-up probe"), ("GLADE_GWZ_TEST_TOO", "made up")]);
+    let _sup = serve(cfg).await.unwrap();
+    let mut expected = shell_added_names(&shim);
+    expected.extend([PROBE, "GLADE_GWZ_TEST_TOO"].map(String::from));
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    assert!(
+        answering(&requester).await,
+        "the gwz supplier attached and answered"
+    );
+    let seen = environments_seen(&requester, &url).await;
+    for (run, (names, probe)) in ["blocking", "streamed"].into_iter().zip(seen) {
+        assert_eq!(
+            names, expected,
+            "{run}: gwz saw exactly the config's variables"
+        );
+        assert_eq!(
+            probe.as_deref(),
+            Some("made-up probe"),
+            "{run}: and their values"
+        );
+    }
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+/// A variable set in the process after the environment was captured never
+/// reaches gwz; one set before the capture does. Both are made up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variable_set_after_the_capture_never_reaches_gwz() {
+    const BEFORE: &str = "GLADE_GWZ_TEST_SET_BEFORE_THE_CAPTURE";
+    const AFTER: &str = "GLADE_GWZ_TEST_SET_AFTER_THE_CAPTURE";
+    let tmp = Tmp::new("env-after");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+
+    std::env::set_var(BEFORE, "made up");
+    let captured = Environment::from_vars(std::env::vars_os());
+    std::env::set_var(AFTER, "made up");
+    let mut cfg = config_for(&url, tmp.path().join("ws"));
+    cfg.gwz_bin = write_env_shim(&tmp, "env-gwz");
+    cfg.env = captured;
+    let _sup = serve(cfg).await.unwrap();
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    assert!(
+        answering(&requester).await,
+        "the gwz supplier attached and answered"
+    );
+    let seen = environments_seen(&requester, &url).await;
+    std::env::remove_var(BEFORE);
+    std::env::remove_var(AFTER);
+    for (run, (names, _)) in ["blocking", "streamed"].into_iter().zip(seen) {
+        assert!(
+            names.contains(BEFORE),
+            "{run}: a variable there at the capture reaches gwz"
+        );
+        assert!(
+            !names.contains(AFTER),
+            "{run}: a variable set after the capture reached gwz"
+        );
+    }
+
+    requester.close().await;
+    node.kill().await.ok();
+}
+
+/// The binary captures its whole start-up environment once, in `main`, and gwz
+/// runs with exactly that, as it did when it inherited it: `PATH`, on which the
+/// default `--gwz-bin gwz` is found as grazel starts the binary, `HOME` and, for
+/// SSH remotes, `SSH_AUTH_SOCK`. The binary starts with the test's variables
+/// alone, so the test can name every one gwz should see.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_gives_gwz_its_start_up_environment() {
+    let tmp = Tmp::new("env-bin");
+    let (mut node, port) = boot(&tmp).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let ws = tmp.path().join("ws");
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim = write_env_shim(&tmp, "bin/gwz");
+
+    let mut supplier = Command::new(env!("CARGO_BIN_EXE_glade-gwz"))
+        .args(["--node", &url, "--root"])
+        .arg(&ws)
+        .args(["--share", "ws-razel", "--principal", "tester"])
+        .env_clear()
+        .env("PATH", &bin_dir)
+        .env("HOME", "/made-up/home")
+        .env("SSH_AUTH_SOCK", "/made-up/agent.sock")
+        .env(PROBE, "made-up probe")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn glade-gwz binary");
+    let mut expected = shell_added_names(&shim);
+    expected.extend(["PATH", "HOME", "SSH_AUTH_SOCK", PROBE].map(String::from));
+
+    let requester = GladeClient::new("requester");
+    requester.connect(&url).await.unwrap();
+    assert!(
+        answering(&requester).await,
+        "the glade-gwz binary attached and answered"
+    );
+    let seen = environments_seen(&requester, &url).await;
+    for (run, (names, probe)) in ["blocking", "streamed"].into_iter().zip(seen) {
+        assert_eq!(
+            names, expected,
+            "{run}: gwz's environment is the binary's start-up one"
+        );
+        assert_eq!(
+            probe.as_deref(),
+            Some("made-up probe"),
+            "{run}: and its values"
+        );
+    }
+
+    requester.close().await;
+    supplier.kill().await.ok();
     node.kill().await.ok();
 }

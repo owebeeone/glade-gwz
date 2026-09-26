@@ -32,6 +32,7 @@ use glade_client::{GladeClient, OpStatus};
 use glade_wire::generated::ExchangeReq;
 
 use crate::envelope::{GwzOutputRecord, GwzRequest, GwzResponse};
+use crate::environment::Environment;
 use crate::exec;
 
 /// The default exchange surface a gwz supplier stands behind (discovery.ts
@@ -43,7 +44,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Everything the supplier needs to attach + serve. `root` and `gwz_bin` are the
 /// app's (never the request's); `share`/`glade_id`/`output_id` are the declared
-/// surfaces; `principal` is the attribution identity (Hello + run stamp).
+/// surfaces; `principal` is the attribution identity (Hello + run stamp); `env`
+/// is the whole environment every gwz run gets, captured once by `main`.
 #[derive(Clone, Debug)]
 pub struct GwzConfig {
     pub node_url: String,
@@ -54,12 +56,13 @@ pub struct GwzConfig {
     pub gwz_bin: PathBuf,
     pub principal: Option<String>,
     pub timeout: Duration,
+    pub env: Environment,
 }
 
 impl GwzConfig {
-    /// A config with the defaulted surfaces + timeout, given the required node,
-    /// root, and gwz binary.
-    pub fn new(node_url: impl Into<String>, root: PathBuf) -> GwzConfig {
+    /// A config with the defaulted surfaces, gwz binary and timeout, given the
+    /// required node, root, and the environment gwz runs with.
+    pub fn new(node_url: impl Into<String>, root: PathBuf, env: Environment) -> GwzConfig {
         GwzConfig {
             node_url: node_url.into(),
             share: DEFAULT_SHARE.into(),
@@ -69,6 +72,7 @@ impl GwzConfig {
             gwz_bin: PathBuf::from("gwz"),
             principal: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            env,
         }
     }
 }
@@ -234,16 +238,17 @@ fn answer(
         return GwzResponse::accepted(run_id, who);
     }
 
-    match exec::run_blocking(&config.gwz_bin, &config.root, &req.verb, &req.args, config.timeout) {
+    match exec::run_blocking(&config.gwz_bin, &config.env, &config.root, &req.verb, &req.args, config.timeout) {
         Ok(o) => GwzResponse::ran(o.exit, o.stdout, o.stderr, who),
         Err(e) => GwzResponse::failed(e),
     }
 }
 
-/// Spawn the long-op streaming task: run `gwz` async, append each stdout/stderr
-/// line as a LOG op keyed by `run_id`, then a terminal `{done:true, exit}` op.
-/// Best-effort — an append failure (link drop mid-run) is dropped; the exchange
-/// answer already carried the run id.
+/// Spawn the long-op streaming task: run `gwz` async ([`exec::command`], in the
+/// captured environment), append each stdout/stderr line as a LOG op keyed by
+/// `run_id`, then a terminal `{done:true, exit}` op. Best-effort — an append
+/// failure (link drop mid-run) is dropped; the exchange answer already carried
+/// the run id.
 fn spawn_stream(
     client: GladeClient,
     config: Arc<GwzConfig>,
@@ -253,12 +258,14 @@ fn spawn_stream(
     who: Option<String>,
 ) {
     handle.spawn(async move {
-        let argv = exec::argv(&config.root, &req.verb, &req.args);
-        let mut cmd = tokio::process::Command::new(&config.gwz_bin);
-        cmd.args(&argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        let gwz = exec::command(
+            &config.gwz_bin,
+            &config.env,
+            &config.root,
+            &req.verb,
+            &req.args,
+        );
+        let mut cmd = tokio::process::Command::from(gwz);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

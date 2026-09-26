@@ -9,13 +9,17 @@
 //!
 //! It connects, attaches as THE provider for `(share, glade_id)`, reattaches on
 //! link drop (the kit helper), and tears the session down cleanly on a signal.
+//!
+//! gwz runs with the environment this process started with: `main` captures it
+//! once and passes it down (ProcessGlobalsPlan Step 3.2).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use glade_gwz::{
-    serve, GwzConfig, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID, DEFAULT_SHARE, DEFAULT_TIMEOUT_SECS,
+    serve, Environment, GwzConfig, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID, DEFAULT_SHARE,
+    DEFAULT_TIMEOUT_SECS,
 };
 
 const USAGE: &str = "usage: glade-gwz --node ws://HOST:PORT --root DIR \
@@ -24,7 +28,11 @@ const USAGE: &str = "usage: glade-gwz --node ws://HOST:PORT --root DIR \
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let config = match parse_args(std::env::args().skip(1).collect()) {
+    // The process's one read of its environment: all of it, so gwz gets what it
+    // got when it inherited it (PATH, HOME, SSH_AUTH_SOCK, …), and nothing set
+    // later.
+    let env = Environment::from_vars(std::env::vars_os());
+    let config = match parse_args(std::env::args().skip(1).collect(), env) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("glade-gwz: {e}\n{USAGE}");
@@ -78,8 +86,9 @@ async fn wait_for_shutdown_signal() {
 }
 
 /// A tiny hand-rolled flag parser (the crate stays dep-light — no clap). `--node`
-/// and `--root` are required; everything else defaults.
-fn parse_args(args: Vec<String>) -> Result<GwzConfig, String> {
+/// and `--root` are required; everything else defaults. `env` is what `main`
+/// captured, carried into the config.
+fn parse_args(args: Vec<String>, env: Environment) -> Result<GwzConfig, String> {
     let mut node: Option<String> = None;
     let mut root: Option<PathBuf> = None;
     let mut share = DEFAULT_SHARE.to_string();
@@ -119,5 +128,6 @@ fn parse_args(args: Vec<String>) -> Result<GwzConfig, String> {
         gwz_bin,
         principal,
         timeout: Duration::from_secs(timeout_secs),
+        env,
     })
 }

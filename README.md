@@ -20,6 +20,10 @@ glade-gwz --node ws://127.0.0.1:9099 --root /path/to/workspace \
 Attaches, serves, reattaches on link drop, and shuts down cleanly on
 SIGTERM/SIGINT.
 
+gwz runs with the environment `glade-gwz` started with. It is captured once, at
+start, and each run starts from an empty environment plus that snapshot, so a
+variable set in the process later never reaches gwz.
+
 ## Command surface (exchange `gwz.ops`)
 
 Request payload — a small JSON envelope:

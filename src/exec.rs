@@ -15,11 +15,16 @@
 //! and read-only verbs finish well under the timeout; per-surface answers already
 //! serialize at the authority (the `workspace.lock` in discovery.ts phase D). The
 //! long / streaming path is async and lives in [`crate::supplier`].
+//!
+//! Both start gwz through [`command`]: from an empty environment plus the one
+//! `main` captured at start, never this process's live one.
 
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+use crate::environment::Environment;
 
 /// Stage-1 read-only allow-list. `status` / `ls` / `diff` are the pure read
 /// verbs (exit 0; no member mutation, no lock write, no arbitrary exec).
@@ -69,6 +74,28 @@ pub fn argv(root: &Path, verb: &str, args: &[String]) -> Vec<String> {
     v
 }
 
+/// The one `gwz` process both runners start: `gwz --root <root> <verb> <args…>`
+/// ([`argv`]), stdin closed, both output pipes captured. gwz inherits nothing
+/// from this process's environment: it gets `env_clear()`, then exactly `env`,
+/// the snapshot `main` captured at start (ProcessGlobalsPlan Step 3.2). The
+/// streaming runner turns it into a `tokio::process::Command`.
+pub fn command(
+    gwz_bin: &Path,
+    env: &Environment,
+    root: &Path,
+    verb: &str,
+    args: &[String],
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(gwz_bin);
+    cmd.args(argv(root, verb, args))
+        .env_clear()
+        .envs(env.vars())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// A finished blocking run.
 #[derive(Debug)]
 pub struct RunOutput {
@@ -78,21 +105,19 @@ pub struct RunOutput {
 }
 
 /// Run `gwz --root <root> <verb> <args…>` to completion, blocking, with a hard
-/// `timeout`. On timeout the child is killed and `Err("timed out …")` is
-/// returned (failure as data at the call site). A spawn failure is likewise an
-/// `Err`. Pipes drain on threads so output never deadlocks the wait.
+/// `timeout`, in the environment `env` ([`command`]). On timeout the child is
+/// killed and `Err("timed out …")` is returned (failure as data at the call
+/// site). A spawn failure is likewise an `Err`. Pipes drain on threads so output
+/// never deadlocks the wait.
 pub fn run_blocking(
     gwz_bin: &Path,
+    env: &Environment,
     root: &Path,
     verb: &str,
     args: &[String],
     timeout: Duration,
 ) -> Result<RunOutput, String> {
-    let mut child = std::process::Command::new(gwz_bin)
-        .args(argv(root, verb, args))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut child = command(gwz_bin, env, root, verb, args)
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", gwz_bin.display()))?;
 
@@ -165,6 +190,11 @@ mod tests {
         assert_eq!(v, vec!["--root", "/ws", "status", "--porcelain"]);
     }
 
+    /// This test process's own environment, which gwz inherited before Step 3.2.
+    fn live() -> Environment {
+        Environment::from_vars(std::env::vars_os())
+    }
+
     #[test]
     fn run_blocking_times_out_on_a_slow_shim() {
         // A shim that ignores its args and sleeps past the timeout (no real gwz
@@ -178,14 +208,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let err = run_blocking(&shim, Path::new("/tmp"), "status", &[], Duration::from_millis(150)).unwrap_err();
+        let err = run_blocking(&shim, &live(), Path::new("/tmp"), "status", &[], Duration::from_millis(150)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn run_blocking_reports_a_spawn_failure_as_err() {
-        let err = run_blocking(Path::new("/no/such/gwz-binary"), Path::new("/tmp"), "status", &[], Duration::from_secs(1)).unwrap_err();
+        let err = run_blocking(Path::new("/no/such/gwz-binary"), &live(), Path::new("/tmp"), "status", &[], Duration::from_secs(1)).unwrap_err();
         assert!(err.contains("failed to spawn"), "{err}");
     }
 }

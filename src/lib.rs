@@ -11,14 +11,18 @@
 //!
 //! Modules:
 //! * [`envelope`] — the request / response / output-record JSON shapes.
+//! * [`environment`] — [`Environment`]: what `main` captures once, and every gwz
+//!   run gets.
 //! * [`exec`] — the verb allow-list, arg guards, and the blocking runner.
 //! * [`supplier`] — [`serve`], [`GwzConfig`], [`GwzSupplier`]: attach + serve.
 
 pub mod envelope;
+pub mod environment;
 pub mod exec;
 pub mod supplier;
 
 pub use envelope::{GwzOutputRecord, GwzRequest, GwzResponse};
+pub use environment::Environment;
 pub use exec::ALLOWED_VERBS;
 pub use supplier::{
     serve, GwzConfig, GwzSupplier, DEFAULT_GLADE_ID, DEFAULT_OUTPUT_ID, DEFAULT_SHARE,

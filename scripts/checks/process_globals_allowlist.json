@@ -14,18 +14,18 @@
       "reason": "The program reads its arguments once, at its entry point, and passes them down."
     },
     {
+      "path": "src/bin/glade-gwz.rs",
+      "kind": "env",
+      "name": "env::vars_os",
+      "disposition": "permanent",
+      "reason": "The program captures its whole environment once, at its entry point, and passes it down; gwz runs with env_clear() plus it (ProcessGlobalsPlan Step 3.2)."
+    },
+    {
       "path": "src/exec.rs",
       "kind": "process",
       "name": "Command::new",
-      "disposition": "debt",
-      "reason": "Runs gwz with the live process environment; spawn it with env_clear() plus the supplier's captured environment (ProcessGlobalsPlan Step 3.2)."
-    },
-    {
-      "path": "src/supplier.rs",
-      "kind": "process",
-      "name": "Command::new",
-      "disposition": "debt",
-      "reason": "Runs a streamed gwz verb with the live process environment; spawn it with env_clear() plus the supplier's captured environment (ProcessGlobalsPlan Step 3.2)."
+      "disposition": "permanent",
+      "reason": "exec::command, the one place glade-gwz builds a gwz command (the blocking runner spawns it, the streamed verb converts it to tokio's), spawns gwz with env_clear() plus the environment main captured. The checker lists every Command::new, so a spawn that clears the environment is recorded as permanent, as gwz-core records its own (ProcessGlobalsPlan Step 3.2)."
     }
   ]
 }
