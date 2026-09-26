@@ -19,10 +19,17 @@ fn repo() -> PathBuf {
 fn no_new_process_global_state() {
     let repo = repo();
     let checker = repo.join("scripts/checks/check_process_globals.py");
-    let ran = Command::new("python3").arg(&checker).arg("--repo").arg(&repo).output();
+    let ran = Command::new("python3")
+        .arg(&checker)
+        .arg("--repo")
+        .arg(&repo)
+        .output();
     let out = match ran {
         Ok(out) => out,
-        Err(e) => panic!("python3 (3.10 or later) must run {}: {e}", checker.display()),
+        Err(e) => panic!(
+            "python3 (3.10 or later) must run {}: {e}",
+            checker.display()
+        ),
     };
     assert!(
         out.status.success(),
