@@ -3,6 +3,8 @@
 This repository is a member of the glade-wz workspace, whose `AGENTS.md` holds the
 general rules (TDD first, the workflow). These rules are this repository's own.
 
+`cargo test` also checks formatting; the fix is `cargo fmt`, never a skip.
+
 ## No process globals
 
 Production code MUST keep no process-global mutable state:
