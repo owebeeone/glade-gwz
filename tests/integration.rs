@@ -70,7 +70,10 @@ fn ensure_node_built() {
         .current_dir(manifest().join("../glade/node"))
         .status()
         .expect("build glade-node");
-    assert!(status.success() && bin.exists(), "glade-node missing after build");
+    assert!(
+        status.success() && bin.exists(),
+        "glade-node missing after build"
+    );
 }
 
 /// A temp dir that removes itself on drop (never the real `~/.glade`).
@@ -78,7 +81,11 @@ struct Tmp(PathBuf);
 impl Tmp {
     fn new(tag: &str) -> Tmp {
         static N: AtomicU64 = AtomicU64::new(0);
-        let uniq = format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst));
+        let uniq = format!(
+            "{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        );
         let p = std::env::temp_dir().join(format!("glade-gwz-{tag}-{uniq}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -183,7 +190,11 @@ async fn ask(requester: &GladeClient, envelope: &str) -> GwzResponse {
         .exchange("ws-razel", "gwz.ops", envelope.as_bytes().to_vec())
         .await
         .expect("exchange");
-    assert!(out.ok, "wire ExchangeRes.ok is always true (failure is in the payload); error={:?}", out.error);
+    assert!(
+        out.ok,
+        "wire ExchangeRes.ok is always true (failure is in the payload); error={:?}",
+        out.error
+    );
     serde_json::from_slice(&out.payload.expect("payload")).expect("GwzResponse json")
 }
 
@@ -223,7 +234,10 @@ async fn allowlisted_verbs_round_trip_real_gwz() {
     let status = ask(&requester, r#"{"verb":"status"}"#).await;
     assert!(status.ok, "status ran clean: {status:?}");
     assert_eq!(status.exit, Some(0));
-    assert!(!status.stdout.is_empty(), "status produced output: {status:?}");
+    assert!(
+        !status.stdout.is_empty(),
+        "status produced output: {status:?}"
+    );
     assert_eq!(status.attributed_to.as_deref(), Some("gianni"));
 
     // ls + diff also answer ok:true, exit 0.
@@ -255,22 +269,47 @@ async fn disallowed_verb_and_denied_arg_fail_as_data() {
     requester.connect(&url).await.unwrap();
     // ensure attached
     let r = requester.clone();
-    assert!(poll(|| { let r = r.clone(); async move { r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await.map(|o| o.ok).unwrap_or(false) } }).await);
+    assert!(
+        poll(|| {
+            let r = r.clone();
+            async move {
+                r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                    .await
+                    .map(|o| o.ok)
+                    .unwrap_or(false)
+            }
+        })
+        .await
+    );
 
     // a mutating verb never reaches gwz — refused as data.
     let commit = ask(&requester, r#"{"verb":"commit","args":["-m","x"]}"#).await;
     assert!(!commit.ok, "commit refused: {commit:?}");
-    assert!(commit.error.as_deref().unwrap_or("").contains("allow-list"), "{commit:?}");
+    assert!(
+        commit.error.as_deref().unwrap_or("").contains("allow-list"),
+        "{commit:?}"
+    );
     assert!(commit.exit.is_none(), "gwz was never invoked: {commit:?}");
 
     // an allowed verb carrying a scope-redirecting arg is refused (root is
     // app-owned).
     let escape = ask(&requester, r#"{"verb":"status","args":["--root","/etc"]}"#).await;
-    assert!(!escape.ok && escape.error.as_deref().unwrap_or("").contains("not permitted"), "{escape:?}");
+    assert!(
+        !escape.ok
+            && escape
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not permitted"),
+        "{escape:?}"
+    );
 
     // a bad envelope is data, not a hang.
     let bad = ask(&requester, "not json").await;
-    assert!(!bad.ok && bad.error.as_deref().unwrap_or("").contains("bad envelope"), "{bad:?}");
+    assert!(
+        !bad.ok && bad.error.as_deref().unwrap_or("").contains("bad envelope"),
+        "{bad:?}"
+    );
 
     requester.close().await;
     node.kill().await.ok();
@@ -316,9 +355,13 @@ async fn timeout_fails_as_data() {
     let timed_out = poll(|| {
         let r = requester.clone();
         async move {
-            match r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await {
+            match r
+                .exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                .await
+            {
                 Ok(o) if o.ok => {
-                    let resp: GwzResponse = serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    let resp: GwzResponse =
+                        serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
                     !resp.ok && resp.error.as_deref().unwrap_or("").contains("timed out")
                 }
                 _ => false,
@@ -345,18 +388,34 @@ async fn streaming_output_visible_to_subscriber() {
     let requester = GladeClient::new("requester");
     requester.connect(&url).await.unwrap();
     let r = requester.clone();
-    assert!(poll(|| { let r = r.clone(); async move { r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await.map(|o| o.ok).unwrap_or(false) } }).await);
+    assert!(
+        poll(|| {
+            let r = r.clone();
+            async move {
+                r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                    .await
+                    .map(|o| o.ok)
+                    .unwrap_or(false)
+            }
+        })
+        .await
+    );
 
     // a streaming run answers immediately with the run id.
     let accepted = ask(&requester, r#"{"verb":"status","stream":true}"#).await;
-    assert!(accepted.ok && accepted.done == Some(false), "streaming accept: {accepted:?}");
+    assert!(
+        accepted.ok && accepted.done == Some(false),
+        "streaming accept: {accepted:?}"
+    );
     let run_id = accepted.run_id.expect("run_id on the accept");
 
     // a subscriber on the output surface, keyed by run id, converges the run's
     // output ops + the terminal marker (from-cursor backfill covers timing).
     let sub = GladeClient::new("subscriber");
     sub.connect(&url).await.unwrap();
-    sub.subscribe("ws-razel", "gwz.output", Some(run_id.as_bytes())).await.unwrap();
+    sub.subscribe("ws-razel", "gwz.output", Some(run_id.as_bytes()))
+        .await
+        .unwrap();
 
     let s = sub.clone();
     let key = run_id.clone();
@@ -364,24 +423,46 @@ async fn streaming_output_visible_to_subscriber() {
         let s = s.clone();
         let key = key.clone();
         async move {
-            let entries = s.fold_log("ws-razel", "gwz.output", Some(key.as_bytes())).await;
+            let entries = s
+                .fold_log("ws-razel", "gwz.output", Some(key.as_bytes()))
+                .await;
             entries.iter().any(|e| {
-                serde_json::from_slice::<GwzOutputRecord>(e).map(|r| r.done == Some(true)).unwrap_or(false)
+                serde_json::from_slice::<GwzOutputRecord>(e)
+                    .map(|r| r.done == Some(true))
+                    .unwrap_or(false)
             })
         }
     })
     .await;
-    assert!(converged, "the streaming output + done marker reached the subscriber");
+    assert!(
+        converged,
+        "the streaming output + done marker reached the subscriber"
+    );
 
     // decode the run: at least one output line, a terminal marker carrying
     // exit 0, and every record stamped with the acting principal.
-    let entries = sub.fold_log("ws-razel", "gwz.output", Some(run_id.as_bytes())).await;
-    let recs: Vec<GwzOutputRecord> =
-        entries.iter().filter_map(|e| serde_json::from_slice(e).ok()).collect();
-    assert!(recs.iter().any(|r| r.stream == "stdout" && r.line.is_some()), "an output line: {recs:?}");
-    let end = recs.iter().find(|r| r.done == Some(true)).expect("terminal marker");
+    let entries = sub
+        .fold_log("ws-razel", "gwz.output", Some(run_id.as_bytes()))
+        .await;
+    let recs: Vec<GwzOutputRecord> = entries
+        .iter()
+        .filter_map(|e| serde_json::from_slice(e).ok())
+        .collect();
+    assert!(
+        recs.iter()
+            .any(|r| r.stream == "stdout" && r.line.is_some()),
+        "an output line: {recs:?}"
+    );
+    let end = recs
+        .iter()
+        .find(|r| r.done == Some(true))
+        .expect("terminal marker");
     assert_eq!(end.exit, Some(0), "gwz status exited clean: {end:?}");
-    assert!(recs.iter().all(|r| r.principal.as_deref() == Some("gianni")), "run records attributed: {recs:?}");
+    assert!(
+        recs.iter()
+            .all(|r| r.principal.as_deref() == Some("gianni")),
+        "run records attributed: {recs:?}"
+    );
     // the run records are keyed by run id.
     assert!(recs.iter().all(|r| r.run_id == run_id));
 
@@ -418,9 +499,13 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
     let answered = poll(|| {
         let r = requester.clone();
         async move {
-            match r.exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec()).await {
+            match r
+                .exchange("ws-razel", "gwz.ops", br#"{"verb":"status"}"#.to_vec())
+                .await
+            {
                 Ok(o) if o.ok => {
-                    let resp: GwzResponse = serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
+                    let resp: GwzResponse =
+                        serde_json::from_slice(&o.payload.unwrap_or_default()).unwrap_or_default();
                     resp.ok && resp.attributed_to.as_deref() == Some("tester")
                 }
                 _ => false,
@@ -428,10 +513,17 @@ async fn binary_serves_and_shuts_down_on_sigterm() {
         }
     })
     .await;
-    assert!(answered, "the glade-gwz binary attached and answered a real gwz.status");
+    assert!(
+        answered,
+        "the glade-gwz binary attached and answered a real gwz.status"
+    );
 
     // SIGTERM -> clean shutdown (exit 0).
-    let killed = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status().expect("send SIGTERM");
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
     assert!(killed.success(), "sent SIGTERM");
     let status = tokio::time::timeout(Duration::from_secs(10), supplier.wait())
         .await

@@ -69,7 +69,11 @@ pub fn first_denied_arg(args: &[String]) -> Option<String> {
 /// the verb and its args. Shared by the blocking + streaming runners so the
 /// command shape lives in one place.
 pub fn argv(root: &Path, verb: &str, args: &[String]) -> Vec<String> {
-    let mut v = vec!["--root".to_string(), root.display().to_string(), verb.to_string()];
+    let mut v = vec![
+        "--root".to_string(),
+        root.display().to_string(),
+        verb.to_string(),
+    ];
     v.extend(args.iter().cloned());
     v
 }
@@ -158,7 +162,11 @@ pub fn run_blocking(
     if timed_out {
         return Err(format!("timed out after {}ms", timeout.as_millis()));
     }
-    Ok(RunOutput { exit: status.and_then(|s| s.code()).unwrap_or(-1), stdout, stderr })
+    Ok(RunOutput {
+        exit: status.and_then(|s| s.code()).unwrap_or(-1),
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -170,7 +178,9 @@ mod tests {
         for v in ["status", "ls", "diff"] {
             assert!(verb_allowed(v), "{v} should be allowed");
         }
-        for v in ["commit", "push", "pull", "init", "forall", "capture", "snapshot", "add", "tag"] {
+        for v in [
+            "commit", "push", "pull", "init", "forall", "capture", "snapshot", "add", "tag",
+        ] {
             assert!(!verb_allowed(v), "{v} must be refused in stage-1");
         }
     }
@@ -178,10 +188,22 @@ mod tests {
     #[test]
     fn denied_args_catch_scope_and_force_redirects() {
         assert_eq!(first_denied_arg(&["--porcelain".into()]), None);
-        assert_eq!(first_denied_arg(&["--root".into(), "/etc".into()]).as_deref(), Some("--root"));
-        assert_eq!(first_denied_arg(&["--root=/etc".into()]).as_deref(), Some("--root=/etc"));
-        assert_eq!(first_denied_arg(&["--force".into()]).as_deref(), Some("--force"));
-        assert_eq!(first_denied_arg(&["--all".into()]).as_deref(), Some("--all"));
+        assert_eq!(
+            first_denied_arg(&["--root".into(), "/etc".into()]).as_deref(),
+            Some("--root")
+        );
+        assert_eq!(
+            first_denied_arg(&["--root=/etc".into()]).as_deref(),
+            Some("--root=/etc")
+        );
+        assert_eq!(
+            first_denied_arg(&["--force".into()]).as_deref(),
+            Some("--force")
+        );
+        assert_eq!(
+            first_denied_arg(&["--all".into()]).as_deref(),
+            Some("--all")
+        );
     }
 
     #[test]
@@ -208,14 +230,30 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let err = run_blocking(&shim, &live(), Path::new("/tmp"), "status", &[], Duration::from_millis(150)).unwrap_err();
+        let err = run_blocking(
+            &shim,
+            &live(),
+            Path::new("/tmp"),
+            "status",
+            &[],
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn run_blocking_reports_a_spawn_failure_as_err() {
-        let err = run_blocking(Path::new("/no/such/gwz-binary"), &live(), Path::new("/tmp"), "status", &[], Duration::from_secs(1)).unwrap_err();
+        let err = run_blocking(
+            Path::new("/no/such/gwz-binary"),
+            &live(),
+            Path::new("/tmp"),
+            "status",
+            &[],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert!(err.contains("failed to spawn"), "{err}");
     }
 }

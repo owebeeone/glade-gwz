@@ -104,7 +104,10 @@ pub async fn serve(config: GwzConfig) -> io::Result<GwzSupplier> {
 
     let supplier = Supplier::attach(
         client.clone(),
-        SupplierConfig { principal: config.principal.clone(), ..Default::default() },
+        SupplierConfig {
+            principal: config.principal.clone(),
+            ..Default::default()
+        },
     );
 
     // Listening before anything is written: the output records go out
@@ -114,7 +117,10 @@ pub async fn serve(config: GwzConfig) -> io::Result<GwzSupplier> {
 
     let handler = make_handler(client.clone(), config.clone(), Handle::current());
     supplier
-        .serve_exchange(SupplierSurface::new(&config.share, &config.glade_id, "exchange"), handler)
+        .serve_exchange(
+            SupplierSurface::new(&config.share, &config.glade_id, "exchange"),
+            handler,
+        )
         .await?;
 
     Ok(GwzSupplier { client, supplier })
@@ -223,7 +229,8 @@ fn answer(
     if !exec::verb_allowed(&req.verb) {
         return GwzResponse::failed(format!(
             "verb `{}` not in stage-1 allow-list {:?}",
-            req.verb, exec::ALLOWED_VERBS
+            req.verb,
+            exec::ALLOWED_VERBS
         ));
     }
     if let Some(bad) = exec::first_denied_arg(&req.args) {
@@ -234,11 +241,25 @@ fn answer(
 
     if req.stream {
         let run_id = runs.mint();
-        spawn_stream(client.clone(), config.clone(), handle.clone(), run_id.clone(), req, who.clone());
+        spawn_stream(
+            client.clone(),
+            config.clone(),
+            handle.clone(),
+            run_id.clone(),
+            req,
+            who.clone(),
+        );
         return GwzResponse::accepted(run_id, who);
     }
 
-    match exec::run_blocking(&config.gwz_bin, &config.env, &config.root, &req.verb, &req.args, config.timeout) {
+    match exec::run_blocking(
+        &config.gwz_bin,
+        &config.env,
+        &config.root,
+        &req.verb,
+        &req.args,
+        config.timeout,
+    ) {
         Ok(o) => GwzResponse::ran(o.exit, o.stdout, o.stderr, who),
         Err(e) => GwzResponse::failed(e),
     }
@@ -270,9 +291,21 @@ fn spawn_stream(
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let rec = GwzOutputRecord::line(&run_id, 1, &who, "stderr", format!("failed to spawn {}: {e}", config.gwz_bin.display()));
+                let rec = GwzOutputRecord::line(
+                    &run_id,
+                    1,
+                    &who,
+                    "stderr",
+                    format!("failed to spawn {}: {e}", config.gwz_bin.display()),
+                );
                 append_output(&client, &config, &run_id, &rec).await;
-                append_output(&client, &config, &run_id, &GwzOutputRecord::end(&run_id, 2, &who, -1)).await;
+                append_output(
+                    &client,
+                    &config,
+                    &run_id,
+                    &GwzOutputRecord::end(&run_id, 2, &who, -1),
+                )
+                .await;
                 return;
             }
         };
@@ -307,21 +340,44 @@ fn spawn_stream(
         let mut seq: u64 = 0;
         while let Some((stream, line)) = rx.recv().await {
             seq += 1;
-            append_output(&client, &config, &run_id, &GwzOutputRecord::line(&run_id, seq, &who, stream, line)).await;
+            append_output(
+                &client,
+                &config,
+                &run_id,
+                &GwzOutputRecord::line(&run_id, seq, &who, stream, line),
+            )
+            .await;
         }
 
         let exit = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
         seq += 1;
-        append_output(&client, &config, &run_id, &GwzOutputRecord::end(&run_id, seq, &who, exit)).await;
+        append_output(
+            &client,
+            &config,
+            &run_id,
+            &GwzOutputRecord::end(&run_id, seq, &who, exit),
+        )
+        .await;
     });
 }
 
 /// Append one output record to the log surface, keyed by run id (the value/log
 /// serve act — an op the node folds + replicates to subscribers, §2). A record
 /// the node refuses is said by [`say_refusals`].
-async fn append_output(client: &GladeClient, config: &GwzConfig, run_id: &str, rec: &GwzOutputRecord) {
+async fn append_output(
+    client: &GladeClient,
+    config: &GwzConfig,
+    run_id: &str,
+    rec: &GwzOutputRecord,
+) {
     let _ = client
-        .append(&config.share, &config.output_id, "log", rec.to_bytes(), Some(run_id.as_bytes()))
+        .append(
+            &config.share,
+            &config.output_id,
+            "log",
+            rec.to_bytes(),
+            Some(run_id.as_bytes()),
+        )
         .await;
 }
 

@@ -72,20 +72,38 @@ pub struct GwzResponse {
 impl GwzResponse {
     /// A completed synchronous run: `ok` reflects a clean exit.
     pub fn ran(exit: i32, stdout: String, stderr: String, who: Option<String>) -> GwzResponse {
-        GwzResponse { ok: exit == 0, exit: Some(exit), stdout, stderr, attributed_to: who, ..Default::default() }
+        GwzResponse {
+            ok: exit == 0,
+            exit: Some(exit),
+            stdout,
+            stderr,
+            attributed_to: who,
+            ..Default::default()
+        }
     }
     /// Failure as data: a bad envelope / disallowed verb / timeout / spawn error.
     pub fn failed(error: impl Into<String>) -> GwzResponse {
-        GwzResponse { ok: false, error: Some(error.into()), ..Default::default() }
+        GwzResponse {
+            ok: false,
+            error: Some(error.into()),
+            ..Default::default()
+        }
     }
     /// A streaming run was accepted; output flows to the log surface under `run_id`.
     pub fn accepted(run_id: String, who: Option<String>) -> GwzResponse {
-        GwzResponse { ok: true, run_id: Some(run_id), done: Some(false), attributed_to: who, ..Default::default() }
+        GwzResponse {
+            ok: true,
+            run_id: Some(run_id),
+            done: Some(false),
+            attributed_to: who,
+            ..Default::default()
+        }
     }
     /// Serialize for the exchange payload (never panics — a serialize failure of
     /// these plain structs is not reachable, but stays failure-as-data).
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"serialize failed\"}".to_vec())
+        serde_json::to_vec(self)
+            .unwrap_or_else(|_| b"{\"ok\":false,\"error\":\"serialize failed\"}".to_vec())
     }
 }
 
@@ -109,7 +127,13 @@ pub struct GwzOutputRecord {
 }
 
 impl GwzOutputRecord {
-    pub fn line(run_id: &str, seq: u64, who: &Option<String>, stream: &str, line: String) -> GwzOutputRecord {
+    pub fn line(
+        run_id: &str,
+        seq: u64,
+        who: &Option<String>,
+        stream: &str,
+        line: String,
+    ) -> GwzOutputRecord {
         GwzOutputRecord {
             run_id: run_id.into(),
             seq,
@@ -144,7 +168,10 @@ mod tests {
         let m = GwzRequest::parse(br#"{"verb":"status"}"#).unwrap();
         assert_eq!(m.verb, "status");
         assert!(m.args.is_empty() && m.cwd.is_none() && !m.stream && m.principal.is_none());
-        let f = GwzRequest::parse(br#"{"verb":"diff","args":["--stat"],"cwd":"sub","stream":true,"principal":"gianni"}"#).unwrap();
+        let f = GwzRequest::parse(
+            br#"{"verb":"diff","args":["--stat"],"cwd":"sub","stream":true,"principal":"gianni"}"#,
+        )
+        .unwrap();
         assert_eq!(f.verb, "diff");
         assert_eq!(f.args, vec!["--stat"]);
         assert_eq!(f.cwd.as_deref(), Some("sub"));
